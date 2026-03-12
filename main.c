@@ -6,7 +6,12 @@
 
 #include <stdio.h>
 
-static bool GetServiceBSDPath(io_service_t service, char *pathBuf, size_t pathSize)
+/**
+ * Get the BSD path for a service (if applicable).
+ *
+ * Returns true if the path was successfully obtained and written to the buffer.
+ */
+static bool GetServiceBSDPath(io_service_t service, char *pathBuf, size_t pathLen)
 {
     io_iterator_t iter;
     kern_return_t kr = IORegistryEntryCreateIterator(service,
@@ -36,7 +41,7 @@ static bool GetServiceBSDPath(io_service_t service, char *pathBuf, size_t pathSi
          */
         char disk[64];
         if (CFStringGetFileSystemRepresentation(name, disk, sizeof(disk))) {
-            snprintf(pathBuf, pathSize, "/dev/%s", disk);
+            snprintf(pathBuf, pathLen, "/dev/%s", disk);
             found = true;
         }
 
@@ -52,44 +57,35 @@ static bool GetServiceBSDPath(io_service_t service, char *pathBuf, size_t pathSi
     return found;
 }
 
-static bool GetServiceSerialNumber(io_service_t service, char *buf, size_t len)
+/**
+ * Get the serial number (if applicable) associated with a service.
+ *
+ * Returns true if serial number was successfully obtained and written to the
+ * output buffer.
+ */
+static bool GetServiceSerialNumber(io_service_t service, char *serialBuf, size_t serialLen)
 {
-    static char const *sKeys[] = {
-        /*
-         * Newer versions of macOS uses `kUSBSerialNumberString`, while older
-         * ones use "USB Serial Number".
-         */
-        kUSBSerialNumberString,
-        "USB Serial Number",
-        NULL,
+    static CFStringRef sKeys[] = {
+        CFSTR(kUSBSerialNumberString), /* Used on newer macOS. */
+        CFSTR("USB Serial Number"),    /* Used on older macOS. */
     };
+    static size_t sKeysLen = sizeof(sKeys) / sizeof(*sKeys);
 
     bool found = false;
-    for (int i = 0; sKeys[i] && !found; i++) {
-        CFStringRef key = NULL;
+    for (size_t i = 0; i < sKeysLen && !found; i++) {
+        CFStringRef key = sKeys[i];
         CFTypeRef val = NULL;
-
-        key = CFStringCreateWithCString(kCFAllocatorDefault, sKeys[i], kCFStringEncodingUTF8);
-        if (!key) {
-            goto L_cleanup;
-        }
 
         val = IORegistryEntryCreateCFProperty(service, key, kCFAllocatorDefault, 0);
         if (!val) {
-            goto L_cleanup;
+            continue;
         }
 
         if (CFGetTypeID(val) == CFStringGetTypeID()) {
-            found = CFStringGetCString((CFStringRef)val, buf, (CFIndex)len, kCFStringEncodingUTF8);
+            found = CFStringGetCString(val, serialBuf, (CFIndex)serialLen, kCFStringEncodingUTF8);
         }
 
-    L_cleanup:
-        if (val) {
-            CFRelease(val);
-        }
-        if (key) {
-            CFRelease(key);
-        }
+        CFRelease(val);
     }
 
     return found;
@@ -98,35 +94,34 @@ static bool GetServiceSerialNumber(io_service_t service, char *buf, size_t len)
 static bool GetBSDPathForUSBSerial(char const *serial, char *pathBuf, size_t pathSize)
 {
     static char const *sClasses[] = {
-        /* Newer macOS uses "IOUSBHostDevice" rather than "IOUSBDevice". */
-        "IOUSBHostDevice",
-        "IOUSBDevice",
-        NULL,
+        "IOUSBHostDevice", /* Used on newer macOS. */
+        "IOUSBDevice",     /* Used on older macOS. */
     };
+    static size_t const sClassesLen = sizeof(sClasses) / sizeof(*sClasses);
+
     bool found = false;
-
-    for (int i = 0; sClasses[i] && !found; i++) {
-        CFMutableDictionaryRef matching;
-        io_iterator_t iter = IO_OBJECT_NULL;
-        kern_return_t kr;
-        io_service_t service;
-
-        matching = IOServiceMatching(sClasses[i]);
+    for (size_t i = 0; i < sClassesLen && !found; i++) {
+        CFMutableDictionaryRef matching = IOServiceMatching(sClasses[i]);
         if (!matching) {
-            goto L_cleanup;
+            continue;
         }
 
-        kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter);
-        matching = NULL; /* Consumed by `IOServiceGetMatchingServices`. */
+        io_iterator_t iter;
+        kern_return_t kr = IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter);
         if (kr != KERN_SUCCESS || iter == IO_OBJECT_NULL) {
-            goto L_cleanup;
+            /*
+             * Matching dictionary does not need to be released as it has
+             * already been consumed by `IOServiceGetMatchingServices`.
+             */
+            continue;
         }
 
+        io_service_t service;
         while (!found && (service = IOIteratorNext(iter)) != IO_OBJECT_NULL) {
-            char currentSerial[256] = { 0 };
+            char serviceSerial[256] = { 0 };
 
-            if (GetServiceSerialNumber(service, currentSerial, sizeof(currentSerial))) {
-                if (strcmp(currentSerial, serial) == 0) {
+            if (GetServiceSerialNumber(service, serviceSerial, sizeof(serviceSerial))) {
+                if (strcmp(serviceSerial, serial) == 0) {
                     found = GetServiceBSDPath(service, pathBuf, pathSize);
                 }
             }
@@ -134,12 +129,8 @@ static bool GetBSDPathForUSBSerial(char const *serial, char *pathBuf, size_t pat
             IOObjectRelease(service);
         }
 
-    L_cleanup:
         if (iter) {
             IOObjectRelease(iter);
-        }
-        if (matching) {
-            CFRelease(matching);
         }
     }
 
@@ -153,13 +144,13 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    char path[PATH_MAX];
-    if (!GetBSDPathForUSBSerial(argv[1], path, sizeof(path))) {
+    char bsdPath[PATH_MAX];
+    if (!GetBSDPathForUSBSerial(argv[1], bsdPath, sizeof(bsdPath))) {
         fprintf(stderr, "Error: No disk found for serial: %s\n", argv[1]);
         return EXIT_FAILURE;
     }
 
-    printf("%s\n", path);
+    printf("%s\n", bsdPath);
 
     return EXIT_SUCCESS;
 }
